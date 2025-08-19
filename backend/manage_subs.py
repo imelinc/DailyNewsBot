@@ -17,24 +17,30 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # -------------------- helpers --------------------
 
 def _cors():
+    # CORS consistente en TODAS las respuestas
     return {
         "Access-Control-Allow-Origin": CORS_ORIGIN,
         "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type"
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Vary": "Origin"
     }
 
 def _json(status, body):
+    # Siempre Content-Type JSON + CORS
     return {
         "statusCode": status,
-        "headers": _cors(),
+        "headers": {**_cors(), "Content-Type": "application/json"},
         "body": json.dumps(body, ensure_ascii=False)
     }
+
+def _preflight():
+    # Respuesta al OPTIONS (sin body)
+    return { "statusCode": 204, "headers": _cors(), "body": "" }
 
 def _is_valid_arn(arn: str) -> bool:
     return isinstance(arn, str) and arn.startswith("arn:aws:sns:") and arn.count(":") >= 5
 
 def _count_current():
-    # Cuenta suscriptores (pendientes + confirmados)
     resp = ddb.scan(ProjectionExpression="email")
     return len(resp.get('Items', []))
 
@@ -48,7 +54,7 @@ def _list_sns():
         ) if token else sns.list_subscriptions_by_topic(TopicArn=TOPIC_ARN)
 
         for s in resp.get('Subscriptions', []):
-            ep = (s.get('Endpoint') or "").strip().lower()
+            ep  = (s.get('Endpoint') or "").strip().lower()
             arn = (s.get('SubscriptionArn') or "").strip()
             if not ep:
                 continue
@@ -56,12 +62,10 @@ def _list_sns():
             out[ep] = {"arn": arn, "status": status}
 
         token = resp.get('NextToken')
-        if not token:
-            break
+        if not token: break
     return out
 
 def _sync_ddb_with_sns():
-    # Escribe/actualiza status y ARN en DDB según lo que ve SNS
     sns_map = _list_sns()
     resp = ddb.scan()
     for it in resp.get('Items', []):
@@ -77,15 +81,13 @@ def _sync_ddb_with_sns():
 
 # -------------------- handler --------------------
 
-def handler(event, context):
-    # Soporte para HTTP API (payload v2)
+def lambda_handler(event, context):
     http = event.get('requestContext', {}).get('http', {})
     method = http.get('method', 'GET')
     path   = event.get('rawPath', '/')
 
     if method == 'OPTIONS':
-        # Preflight CORS
-        return {"statusCode": 200, "headers": _cors(), "body": ""}
+        return _preflight()
 
     try:
         # ---------- POST /subscribe ----------
@@ -96,16 +98,13 @@ def handler(event, context):
             if not EMAIL_RE.match(email):
                 return _json(400, {"error": "Email inválido"})
 
-            # límite 7
             if _count_current() >= MAX_SUBS:
                 return _json(409, {"error": f"Límite de {MAX_SUBS} suscriptores alcanzado"})
 
-            # ya existe?
             existing = ddb.get_item(Key={"email": email}).get('Item')
             if existing:
                 return _json(200, {"message": f"{email} ya estaba {existing.get('status','UNKNOWN')}"})
 
-            # Suscribe en SNS (envía email de confirmación)
             sns.subscribe(
                 TopicArn=TOPIC_ARN,
                 Protocol='email',
@@ -113,7 +112,6 @@ def handler(event, context):
                 ReturnSubscriptionArn=False
             )
 
-            # Guarda en DDB como PENDING
             ddb.put_item(Item={
                 "email": email,
                 "status": "PENDING",
@@ -130,30 +128,24 @@ def handler(event, context):
             if not EMAIL_RE.match(email):
                 return _json(400, {"error": "Email inválido"})
 
-            # 1) intentar obtener ARN desde DDB
             arn = None
             item = ddb.get_item(Key={"email": email}).get('Item')
             if item:
                 arn = item.get('subscription_arn')
 
-            # 2) si no es un ARN válido, buscar en SNS por endpoint
             if not _is_valid_arn(arn):
                 info = _list_sns().get(email)
                 if info:
                     arn = info.get('arn')
 
-            # 3) casos especiales
             if arn == 'PendingConfirmation':
-                # No existe todavía un ARN "real" en SNS
                 ddb.delete_item(Key={"email": email})
                 return _json(200, {"message": f"{email} estaba pendiente de confirmación. Se eliminó del listado local."})
 
             if not _is_valid_arn(arn):
-                # No hay suscripción activa en SNS
                 ddb.delete_item(Key={"email": email})
                 return _json(200, {"message": f"No encontramos suscripción SNS activa para {email}. Se eliminó del listado."})
 
-            # 4) desuscribir en SNS + borrar de DDB
             sns.unsubscribe(SubscriptionArn=arn)
             ddb.delete_item(Key={"email": email})
             return _json(200, {"message": f"{email} desuscripto correctamente."})
@@ -161,7 +153,7 @@ def handler(event, context):
         # ---------- GET /subscribers ----------
         if path == '/subscribers' and method == 'GET':
             _sync_ddb_with_sns()
-            resp = ddb.scan(ProjectionExpression="email, #s", ExpressionAttributeNames={"#s": "status"})
+            resp = ddb.scan(ProjectionExpression="email, #s", ExpressionAttributeNames={"#s":"status"})
             items = sorted(resp.get('Items', []), key=lambda x: x['email'])
             return _json(200, {"subscribers": items})
 
@@ -169,6 +161,5 @@ def handler(event, context):
         return _json(404, {"error": "Ruta no encontrada"})
 
     except Exception as e:
-        # Falla controlada para no romper API Gateway
         print("ERROR:", repr(e))
         return _json(500, {"error": "Unexpected error", "detail": str(e)})
